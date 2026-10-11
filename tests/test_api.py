@@ -431,3 +431,42 @@ def test_health_creates_missing_indexes(monkeypatch):
     assert TestClient(m.app).get("/health").status_code == 200
     assert "uq_emp_code" in client["late_db"].employees.index_information()
     assert "uq_emp_date" in client["late_db"].attendance_logs.index_information()
+
+
+# ---------------- /admin/explain validation (the explain command itself needs a real MongoDB) ----------------
+@pytest.mark.parametrize("path", [
+    "/admin/explain/nonsense",
+    "/admin/explain/employee_monthly",                                  # emp_code + month missing
+    "/admin/explain/employee_monthly?emp_code=EMP0001",                 # month missing
+    "/admin/explain/employee_monthly?emp_code=EMP0001&month=2026-13",
+    "/admin/explain/department_summary",
+    "/admin/explain/late_leaderboard?month=2026-07&limit=0",
+    "/admin/explain/late_leaderboard?month=2026-07&limit=51",
+    "/admin/explain/department_trend?department=Sales&from=2026-07-01",
+    "/admin/explain/department_trend?department=Sales&from=2026-07-10&to=2026-07-01",
+    "/admin/explain/department_trend?department=Sales&from=2026-01-01&to=2026-04-03",   # 93 days
+    "/admin/explain/department_trend?from=2026-07-01&to=2026-07-05",                      # department missing
+    "/admin/explain/attendance_list?date_from=2026-02-30",
+    "/admin/explain/attendance_list?status=BOGUS",
+    "/admin/explain/attendance_list?page=0",
+])
+def test_explain_validation_422(api, path):
+    assert api.get(path).status_code == 422
+
+
+def test_explain_runs_the_same_query_builders(api, monkeypatch):
+    """The explain endpoint must hand MongoDB exactly what the real endpoint builds. mongomock has no explain, so capture the command."""
+    seen = {}
+    monkeypatch.setattr(m.db, "command", lambda cmd, *a, **kw: seen.update(cmd=cmd) or {"ok": 1.0, "inf": float("inf")})
+    r = api.get("/admin/explain/attendance_list", params={"emp_code": "EMP0001", "date_from": "2026-07-01", "page": 2, "page_size": 10})
+    expected = m.build_attendance_query("EMP0001", "2026-07-01", None, None, 2, 10)
+    assert r.status_code == 200 and r.json()["collection"] == "attendance_logs"
+    assert r.json()["explain"]["inf"] == {"$numberDouble": "Infinity"}          # valid JSON, never a bare Infinity
+    inner = seen["cmd"]["explain"]
+    assert (inner["filter"], inner["skip"], inner["limit"]) == (expected["filter"], expected["skip"], expected["limit"])
+    assert seen["cmd"]["verbosity"] == "executionStats" and list(seen["cmd"])[0] == "explain"
+    r = api.get("/admin/explain/department_summary", params={"month": "2026-07", "department": "Sales"})
+    _, pipeline, hint = m.build_department_summary_pipeline("2026-07", "Sales")
+    assert seen["cmd"]["explain"]["pipeline"] == pipeline and seen["cmd"]["explain"]["hint"] == hint
+    r = api.get("/admin/explain/department_trend", params={"department": "Sales", "from": "2026-07-01", "to": "2026-07-31"})
+    assert r.status_code == 200 and seen["cmd"]["explain"]["aggregate"] == "employees"

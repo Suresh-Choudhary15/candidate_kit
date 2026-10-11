@@ -8,7 +8,9 @@ All application code lives in this single file, organised in sections:
 Config -> Time helpers -> Rules (R1-R5) -> Indexes -> App & health -> (endpoints are added below).
 """
 import calendar
+import json
 import logging
+import math
 import os
 import re
 import time
@@ -17,6 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -836,5 +839,76 @@ def department_trend(department: str, date_from: str = Query(alias="from"), date
 
 
 # --------------------------------------------------------------------------- #
-# Still to come: /admin/explain/{endpoint}.
+# Admin: explain (proves the main query of an endpoint uses indexes)
 # --------------------------------------------------------------------------- #
+ExplainEndpoint = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def _require(value, name: str):
+    if value is None:
+        raise unprocessable(f"{name} is required for this endpoint", ("query", name))
+    return value
+
+
+def _json_safe(value):
+    """Explain output -> plain JSON values. Non-finite floats (Infinity, NaN) are not valid JSON: make them strings."""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    return value
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainEndpoint,
+    emp_code: Optional[str] = None,
+    month: Annotated[Optional[str], Query(pattern=MONTH_PATTERN)] = None,
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    range_from: Optional[str] = Query(None, alias="from"),
+    range_to: Optional[str] = Query(None, alias="to"),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Runs explain('executionStats') on the SAME query/pipeline the real endpoint builds, with the same parameters."""
+    if endpoint == "attendance_list":
+        if date_from is not None:
+            require_date(date_from, "date_from")
+        if date_to is not None:
+            require_date(date_to, "date_to")
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise unprocessable("date_from must not be after date_to", ("query", "date_to"))
+        q = build_attendance_query(emp_code, date_from, date_to, status, page, page_size)
+        collection = "attendance_logs"
+        command = {"find": collection, "filter": q["filter"], "sort": dict(q["sort"]), "skip": q["skip"], "limit": q["limit"]}
+    elif endpoint == "employee_monthly":
+        month_bounds(_require(month, "month"))
+        collection, pipeline = build_employee_monthly_pipeline(_require(emp_code, "emp_code"), month)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    elif endpoint == "department_summary":
+        month_bounds(_require(month, "month"))
+        collection, pipeline, hint = build_department_summary_pipeline(month, department)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}, "hint": hint}
+    elif endpoint == "late_leaderboard":
+        month_bounds(_require(month, "month"))
+        collection, pipeline = build_leaderboard_pipeline(month, limit, department)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    else:  # department_trend
+        _require(department, "department")
+        require_date(_require(range_from, "from"), "from")
+        require_date(_require(range_to, "to"), "to")
+        if range_to < range_from:
+            raise unprocessable("to must not be before from", ("query", "to"))
+        if (date.fromisoformat(range_to) - date.fromisoformat(range_from)).days + 1 > MAX_TREND_DAYS:
+            raise unprocessable(f"the range may cover at most {MAX_TREND_DAYS} days", ("query", "to"))
+        collection, pipeline, hint = build_trend_pipeline(department, range_from, range_to)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}, "hint": hint}
+    result = db.command({"explain": command, "verbosity": "executionStats"})
+    explain = _json_safe(json.loads(json_util.dumps(result, json_options=json_util.RELAXED_JSON_OPTIONS)))
+    return {"endpoint": endpoint, "collection": collection, "explain": explain}

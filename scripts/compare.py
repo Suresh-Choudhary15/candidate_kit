@@ -17,6 +17,7 @@ from app.main import db  # noqa: E402
 parser = argparse.ArgumentParser()
 parser.add_argument("--base", default="http://localhost:8000")
 parser.add_argument("--only", default="monthly,summary,leaderboard,trend")
+parser.add_argument("--months", type=int, default=0, help="only the last N months of data (0 = all); use 2 on the 100k dataset")
 parser.add_argument("--max-employees", type=int, default=40, help="sample size for the per-employee check")
 args = parser.parse_args()
 only = set(args.only.split(","))
@@ -25,7 +26,7 @@ employees = list(db.employees.find({}, {"_id": 0}))
 logs = list(db.attendance_logs.find({}, {"_id": 0}))
 http = httpx.Client(base_url=args.base, timeout=60)
 months = sorted({l["date"][:7] for l in logs}) or ["2026-07"]
-months = months + ["2020-01"]                                            # a month with no data at all
+months = (months[-args.months:] if args.months else months) + ["2020-01"]                                            # a month with no data at all
 depts = sorted({e["department"] for e in employees})
 stats = {"checked": 0, "mismatches": 0, "skipped": set()}
 

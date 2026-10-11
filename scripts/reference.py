@@ -104,11 +104,15 @@ def department_trend(employees, logs, department, date_from, date_to):
     if not members:
         return None
     codes = {e["emp_code"] for e in members}
+    by_date = {}
+    for l in logs:                                                  # one pass over the logs
+        if l["emp_code"] in codes and date_from <= l["date"] <= date_to:
+            by_date.setdefault(l["date"], []).append(l)
     rows, rates = [], []
     day, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
     while day <= end:
         ds = day.isoformat()
-        todays = [l for l in logs if l["emp_code"] in codes and l["date"] == ds]
+        todays = by_date.get(ds, [])
         headcount = sum(1 for e in members if e["joined_on"] <= ds)
         present = sum((presence_value(l) for l in todays), Decimal(0))
         working = day.weekday() < 5
