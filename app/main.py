@@ -17,10 +17,11 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -175,13 +176,19 @@ ATTENDANCE_INDEXES = [
 ]
 
 
+_indexes_ready = False  # set once every index exists; /health retries if startup could not do it
+
+
 def ensure_indexes() -> None:
+    global _indexes_ready
     db.employees.create_indexes(EMPLOYEE_INDEXES)
     db.attendance_logs.create_indexes(ATTENDANCE_INDEXES)
+    _indexes_ready = True
 
 
 def ensure_indexes_with_retry(seconds: int = 15) -> None:
-    """MongoDB may still be starting: retry every second, then log and carry on (never crash)."""
+    """MongoDB may still be starting: retry every second, then log and carry on (never crash).
+    If this gives up, /health creates the indexes later as soon as MongoDB answers."""
     deadline = time.monotonic() + seconds
     while True:
         try:
@@ -190,7 +197,7 @@ def ensure_indexes_with_retry(seconds: int = 15) -> None:
             return
         except PyMongoError as exc:
             if time.monotonic() >= deadline:
-                log.error("could not create indexes: %s", exc)
+                log.error("could not create indexes at startup: %s", exc)
                 return
             time.sleep(1)
 
@@ -207,11 +214,19 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
+@app.exception_handler(ConnectionFailure)
+def database_unreachable(_request: Request, exc: ConnectionFailure):
+    """Any endpoint that cannot reach MongoDB answers 503 instead of a 500 traceback."""
+    return JSONResponse(status_code=503, content={"detail": f"database unavailable: {exc.__class__.__name__}"})
+
+
 @app.get("/health")
 def health():
-    """200 only if MongoDB answers a ping, otherwise 503."""
+    """200 only if MongoDB answers a ping, otherwise 503. Also makes sure the indexes exist."""
     try:
         client.admin.command("ping")
+        if not _indexes_ready:
+            ensure_indexes()
     except PyMongoError as exc:
         raise HTTPException(503, f"database unavailable: {exc.__class__.__name__}")
     return {"status": "ok"}
@@ -222,6 +237,7 @@ def health():
 # --------------------------------------------------------------------------- #
 # StrictInt: rejects floats, strings and booleans. The range rejects second-looking values.
 EpochMs = Annotated[StrictInt, Field(ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)]
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
 
 def parse_date_str(value: str) -> date:
@@ -266,6 +282,15 @@ class PunchInRequest(BaseModel):
 class PunchOutRequest(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
+
+
+class RegularizeRequest(BaseModel):
+    """Manual correction. Derived fields cannot be sent (they are not model fields, so they are ignored)."""
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
 
 # --------------------------------------------------------------------------- #
@@ -404,6 +429,125 @@ def punch_out(body: PunchOutRequest):
     return serialize_record(rec)
 
 
+def require_date(value: str, name: str) -> str:
+    """Validate a YYYY-MM-DD value coming from a query/path parameter -> 422 if invalid."""
+    try:
+        parse_date_str(value)
+    except ValueError as exc:
+        raise HTTPException(422, f"{name}: {exc}")
+    return value
+
+
+def build_attendance_query(emp_code: Optional[str], date_from: Optional[str], date_to: Optional[str],
+                           status: Optional[str], page: int, page_size: int) -> dict:
+    """The ONE place that builds the attendance listing query (the explain endpoint reuses it).
+    Returns the find() specification: filter, sort, skip, limit."""
+    flt: dict = {}
+    if emp_code is not None:
+        flt["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        flt["date"] = {}
+        if date_from is not None:
+            flt["date"]["$gte"] = date_from
+        if date_to is not None:
+            flt["date"]["$lte"] = date_to
+    if status is not None:
+        flt["status"] = status
+    # Required order: date desc, then emp_code asc. When emp_code is fixed by the filter the second key
+    # is constant, so sorting by date alone gives the identical order and lets MongoDB walk the
+    # (emp_code, date) index backwards with no in-memory sort.
+    sort = [("date", DESCENDING)] if emp_code is not None else [("date", DESCENDING), ("emp_code", ASCENDING)]
+    return {"filter": flt, "sort": sort, "skip": (page - 1) * page_size, "limit": page_size}
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if date_from is not None:
+        require_date(date_from, "date_from")
+    if date_to is not None:
+        require_date(date_to, "date_to")
+    if date_from is not None and date_to is not None and date_from > date_to:  # ISO strings sort like dates
+        raise HTTPException(422, "date_from must not be after date_to")
+    q = build_attendance_query(emp_code, date_from, date_to, status, page, page_size)
+    coll = db.attendance_logs
+    # An unfiltered count is answered from collection metadata instead of scanning 100k documents.
+    total = coll.count_documents(q["filter"]) if q["filter"] else coll.estimated_document_count()
+    cursor = coll.find(q["filter"]).sort(q["sort"]).skip(q["skip"]).limit(q["limit"])  # paging done by MongoDB
+    return {"items": [serialize_record(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+
+
 # --------------------------------------------------------------------------- #
-# Still to come: GET /attendance, PATCH /attendance/{emp_code}/{date}, analytics, explain.
+# Endpoints: regularization (manual correction with audit trail)
+# --------------------------------------------------------------------------- #
+CORRECTABLE_FIELDS = ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day")
+
+
+def _record_state(rec: dict) -> dict:
+    """The seven correctable fields of a stored record, with defaults for missing legacy fields."""
+    return {
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0,
+        "half_day": bool(rec.get("half_day", False)),
+    }
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    # NOTE: the path parameter is called `date` to match the contract; it only shadows the datetime.date import here.
+    require_date(date, "date")
+    emp = get_employee_or_404(emp_code)
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for this date")
+    old = _record_state(rec)
+
+    # ---- build the final state of the record ----
+    status = body.status or rec["status"]
+    if status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "ABSENT/LEAVE clear the punch times: do not supply punch_in or punch_out")
+        new_in = new_out = None
+    else:
+        new_in = ms_to_dt(body.punch_in) if body.punch_in is not None else rec.get("punch_in")
+        new_out = ms_to_dt(body.punch_out) if body.punch_out is not None else rec.get("punch_out")
+        if new_in is None:
+            raise HTTPException(422, "a presence status requires a punch_in")
+        if attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != date:  # R1: must stay on the record's day
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if new_out is not None and (new_out <= new_in or new_out - new_in > timedelta(hours=24)):
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours of it")
+    new = {"status": status, "punch_in": new_in, "punch_out": new_out,
+           **derive_fields(status, new_in, new_out, emp, date)}  # recompute R2-R5 from the final times
+
+    # ---- audit entry: only fields that actually changed ----
+    changes = {f: {"from": old[f], "to": new[f]} for f in CORRECTABLE_FIELDS if old[f] != new[f]}
+    if not changes:
+        raise HTTPException(422, "the request changes nothing")
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # ---- optimistic concurrency: write only if the record is still exactly as we read it ----
+    old_history = rec.get("history")
+    expected = {"_id": rec["_id"], "history": old_history, "status": old["status"],
+                "punch_in": old["punch_in"], "punch_out": old["punch_out"]}
+    result = db.attendance_logs.update_one(expected, {"$set": new, "$push": {"history": entry}})
+    if result.matched_count == 0:  # someone else changed it between our read and our write
+        raise HTTPException(409, "record was modified concurrently, retry")
+    rec.update(new)
+    rec["history"] = (old_history or []) + [entry]
+    return serialize_record(rec)
+
+
+# --------------------------------------------------------------------------- #
+# Still to come: analytics (monthly, department summary, leaderboard, trend) and /admin/explain.
 # --------------------------------------------------------------------------- #
