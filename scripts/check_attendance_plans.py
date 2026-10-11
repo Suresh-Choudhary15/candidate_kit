@@ -27,10 +27,15 @@ for name, shape in SHAPES.items():
     cmd = {"find": "attendance_logs", "filter": q["filter"], "sort": dict(q["sort"]),
            "skip": q["skip"], "limit": q["limit"]}
     plan = json.loads(json_util.dumps(db.command({"explain": cmd, "verbosity": "queryPlanner"})))
-    text = json.dumps(plan)
-    coll, sort_stage, ixscan = "COLLSCAN" in text, bool(re.search(r'"stage":\s*"SORT"', text)), "IXSCAN" in text
-    index = re.findall(r'"indexName":\s*"([^"]+)"', text)
-    ok = ixscan and not coll and not sort_stage
+    winning = json.dumps(plan["queryPlanner"]["winningPlan"])   # only the plan that actually runs
+    everything = json.dumps(plan)                               # winning + rejected candidate plans
+    sort_stage = bool(re.search(r'"stage":\s*"SORT"', winning))
+    ixscan = "IXSCAN" in winning
+    coll_any = "COLLSCAN" in everything
+    index = re.findall(r'"indexName":\s*"([^"]+)"', winning)
+    ok = ixscan and not coll_any and not sort_stage
     bad += 0 if ok else 1
-    print(f"{'PASS' if ok else 'FAIL'}  {name:18} index={index[:1]} COLLSCAN={coll} SORT={sort_stage}")
+    print(f"{'PASS' if ok else 'FAIL'}  {name:18} index={index[:1]} COLLSCAN(anywhere)={coll_any} SORT(winning)={sort_stage}")
+    if not ok:
+        print("      winning plan:", winning)
 sys.exit(1 if bad else 0)
